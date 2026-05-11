@@ -1,0 +1,644 @@
+---
+title: "R_finalproject"
+output:
+  pdf_document: default
+  word_document: default
+date: "2026-04-27"
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(echo = TRUE)
+# This sets the working directory for ALL chunks in this file
+knitr::opts_knit$set(root.dir = "/usr4/ds596/vgupta7/final_project")
+```
+
+Note to self:
+When starting a new R studio SCC session, run the library load chunk, skip GDCquery, GDCdownload, and DESeq() chunks, and load("brca_deseq_results.rda")
+
+# Install and Load Bioconductor 
+```{r}
+#if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install(c("TCGAbiolinks", "DESeq2", "SummarizedExperiment"))
+```
+
+# Setup and Loading libraries 
+```{r}
+#Data manipulation
+library(tidyverse)
+
+#Bioinformatics specific packages
+library(TCGAbiolinks)
+library(DESeq2)
+library(SummarizedExperiment)
+
+# Setting the working directory
+setwd("/usr4/ds596/vgupta7/final_project")
+``` 
+
+#PART 1: DATA ACQUISITION
+
+# Search for data on the GDC server
+```{r}
+# Define the search for BRCA Tumor vs Normal samples
+query_brca <- GDCquery(
+    project = "TCGA-BRCA",
+    data.category = "Transcriptome Profiling",
+    data.type = "Gene Expression Quantification",
+    workflow.type = "STAR - Counts",
+    sample.type = c("Primary Tumor", "Solid Tissue Normal")
+)
+
+# View the results of your search
+output_query <- getResults(query_brca)
+
+# Check how many of each sample type you found
+table(output_query$sample_type)
+```
+The TCGA-BRCA cohort has 1,111 tumor samples and 113 normal tissue samples.
+
+
+```{r}
+# Download the actual data files to your SCC directory
+GDCdownload(query_brca)
+```
+
+# Prepare the GDC data
+```{r}
+#Prepare the data into a SummarizedExperiment object
+data_brca <- GDCprepare(query_brca)
+```
+
+R is reading every single one of the 1,224 files and extracting the gene names and "STAR - Counts" column from each file. Then it's aligning them all into one massive matrix where every row is a gene and every column is one patient. Finally, it attaches the clinical metadata (survival info, "Tumor vs. Normal" labels, etc) to that matrix.
+
+## Save the object
+```{r}
+save(data_brca, file = "brca_prepared_data.rda")
+```
+
+## Have a look at the data
+```{r}
+# See the dimensions (Rows = Genes, Cols = Samples)
+dim(data_brca)
+
+# See the first few "Normal" vs "Tumor" labels
+table(colData(data_brca)$sample_type)
+```
+There are 60,660 genes and 1,224 samples (this is the full transcriptomic profile for the BRCA cohort).
+
+#PART 2: DATA MODELING
+
+```{r}
+# 1. Convert the data to a DESeq object
+# Use 'sample_type' as the variable to compare
+dds <- DESeqDataSet(data_brca, design = ~ sample_type)
+
+# 2. Pre-filtering
+# This removes genes with almost zero reads, which speeds up the math and makes the results more reliable.
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+
+# 3. RUN THE ANALYSIS
+# This performs normalization, dispersion estimation, and the actual testing
+dds <- DESeq(dds)
+
+# 4. Get the results
+# This creates a table with Log2FoldChange and p-values
+res <- results(dds, contrast = c("sample_type", "Primary Tumor", "Solid Tissue Normal"))
+
+# 5. Save the results so you don't have to run this again
+save(res, dds, file = "brca_deseq_results.rda")
+
+```
+This chunk of code calculates the p-values and fold changes that will be used for the Volcano Plot.
+
+Note: I hit my 10 GB quota while this ran so the deseq results didn't properly save.
+
+# Check the results of the differential expression analysis
+```{r}
+summary(res)
+```
+
+# Save results into a data frame 
+```{r}
+# Convert the results to a simple, small data frame
+res_df <- as.data.frame(res)
+
+# Save only the results table
+save(res_df, file = "brca_results_dataframe.rda")
+
+# Save the full DESeq objects again (the "Heavy" model)
+# Doing this again because I hit an error with this earlier (exceeded quota)
+save(dds, res, file = "brca_deseq_results_final.rda")
+```
+
+# Verify that the save worked
+```{r}
+# Try to load the file back in under a different name to test it
+load("brca_results_dataframe.rda")
+head(res_df)
+```
+Success!
+
+# Identify the top 10 most up-regulated genes
+```{r}
+# Filter for significant genes and sort by Fold Change
+top_hits <- res_df %>%
+  filter(padj < 0.05) %>%
+  arrange(desc(log2FoldChange)) %>%
+  head(10)
+
+print(top_hits)
+
+```
+Those are high log2FoldChange values! This means that those genes (listed as Ensembl IDs) are massively up-regulated in tumor cells compared to normal tissue.
+
+# PART 3: DATA VISUALIZATION 
+
+# Figure 1: Volcano Plot
+
+# Install EnhancedVolcano
+```{r}
+#if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install("EnhancedVolcano")
+
+library(EnhancedVolcano)
+
+```
+
+# Map Ensembl IDs to Gene Symbols
+```{r}
+# Install the mapping database
+#BiocManager::install("org.Hs.eg.db")
+#library(org.Hs.eg.db)
+
+# 1. Strip the version numbers (the ".13" at the end of IDs)
+# DESeq2 sometimes adds these, but the database needs just the ENSG ID
+clean_ids <- gsub("\\..*", "", rownames(res_df))
+
+# 2. Map IDs to Symbols
+mapping <- mapIds(org.Hs.eg.db,
+                  keys = clean_ids,
+                  column = "SYMBOL",
+                  keytype = "ENSEMBL",
+                  multiVals = "first")
+
+# 3. Add the symbols to your results dataframe
+res_df$symbol <- mapping
+```
+This failed because I'm approaching the quota again.
+
+# Manually label the top 10 up-regulated genes
+```{r}
+# 1. Create a column that is empty by default
+res_df$presentation_label <- ""
+
+# 2. Add the top hits 
+res_df["ENSG00000198930.13", "presentation_label"] <- "AZGP1"
+res_df["ENSG00000135346.9", "presentation_label"] <- "CASP14"
+res_df["ENSG00000197172.10", "presentation_label"] <- "MTRNR2L2"
+res_df["ENSG00000101441.4", "presentation_label"] <- "PIP"
+res_df["ENSG00000213401.10", "presentation_label"] <- "AL022318.1"
+res_df["ENSG00000198788.9", "presentation_label"] <- "MTRNR2L1"
+res_df["ENSG00000259527.2", "presentation_label"] <- "AC011477.1"
+res_df["ENSG00000221867.9", "presentation_label"] <- "AL133341.1"
+res_df["ENSG00000198681.7", "presentation_label"] <- "MTRNR2L8"
+res_df["ENSG00000123500.10", "presentation_label"] <- "MUC1"
+
+```
+
+# Identify the top down-regulated genes
+```{r}
+# Sort by the most NEGATIVE fold change
+down_regulated <- res_df %>%
+  filter(padj < 0.05) %>%
+  arrange(log2FoldChange) %>%
+  head(5)
+
+print(down_regulated)
+```
+```{r}
+
+# Find the 5 most down-regulated genes in YOUR results
+actual_down <- res_df %>%
+  filter(padj < 0.01 & log2FoldChange < -2) %>%
+  arrange(log2FoldChange) %>%
+  head(5)
+
+# Print them to your console so you can see the names
+print(actual_down)
+
+# Update the labels using the IDs found above
+# Replace 'ID_1', 'ID_2', etc., with the IDs printed from the step above
+#res_df[rownames(actual_down)[1], "presentation_label"] <- "Down_1" 
+# (And so on for the others)
+```
+
+# Manually label the top 5 down-regulated genes
+```{r}
+res_df["ENSG00000034971.17", "presentation_label"] <- "FXYD1"
+res_df["ENSG00000174697.5", "presentation_label"] <- "LEP"    
+res_df["ENSG00000149124.11", "presentation_label"] <- "CASP5"
+res_df["ENSG00000277737.3", "presentation_label"]  <- "LINC02224"
+res_df["ENSG00000287148.1", "presentation_label"]  <- "AC009283.1"
+
+```
+
+# Create the Volcano Plot
+```{r}
+# Open the image file
+#png("BRCA_Final_Volcano.png", width = 2400, height = 2000, res = 300)
+
+#Combine the top up-regulated and down-regulated hits
+selected_labels <- c("AZGP1", "CASP14", "PIP", "MUC1", "MTRNR2L1", 
+                        "FXYD1", "LEP", "CASP5", "LINC02224")
+
+EnhancedVolcano(res_df,
+    lab = res_df$presentation_label,
+    x = 'log2FoldChange',
+    y = 'padj',
+    selectLab = selected_labels,
+    title = 'TCGA-BRCA Transcriptomic Profile',
+    subtitle = 'Primary Tumor vs. Solid Tissue Normal',
+    titleLabSize = 15,
+    subtitleLabSize = 11,
+    pCutoff = 0.01,
+    FCcutoff = 2.0,
+    col = c('grey30', 'forestgreen', 'royalblue', 'red2'),
+    legendLabels = c('Not Significant', 'High Fold Change (NS)', 
+                   'Significant (Small FC)', 'Top Hits (Sig. & High FC)'),
+    legendPosition = 'right',
+    legendLabSize = 10,
+    drawConnectors = TRUE,
+    widthConnectors = 0.5,
+    max.overlaps = 20)
+
+```
+
+
+```{r}
+save(res_df, file = "brca_final_table_for_plots.rda")
+
+```
+
+Starting a new session, load deseq results to generate the rest of the figures
+```{r}
+# Load the processed results
+load("brca_results_dataframe.rda")
+
+# Load the full model (for the Heatmap and Boxplots)
+load("brca_deseq_results_final.rda")
+
+```
+
+# Set working directory
+```{r}
+setwd("/usr4/ds596/vgupta7/final_project")
+
+```
+
+# Figure 2: PCA plot
+
+# Transform the data for PCA
+```{r}
+# Apply VST transformation
+# blind = FALSE means it will use your design formula to be more accurate
+vsd <- vst(dds, blind = FALSE)
+```
+
+Raw counts in RNA-seq have a "mean-variance" relationship (highly expressed genes have higher variance), which can bias the PCA. The Variance Stabilizing Transformation (VST) makes this look more like a normal distribution.
+
+# Generate the PCA Plot
+```{r}
+# Generate the PCA data
+pcaData <- plotPCA(vsd, intgroup = "definition", returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+# Create the plot
+library(ggplot2)
+ggplot(pcaData, aes(PC1, PC2, color = definition)) +
+  geom_point(size = 3, alpha = 0.6) + # Alpha makes the 1,200 points readable
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  theme_bw() + 
+  scale_color_manual(values = c("Primary solid Tumor" = "red2", 
+                                "Solid Tissue Normal" = "royalblue")) +
+  labs(title = "Global Transcriptomic Variance (PCA)",
+       subtitle = "TCGA-BRCA: Tumor vs. Normal",
+       color = "Sample Type") +
+  theme(plot.title = element_text(size = 15, face = "bold"),
+        legend.position = "bottom")
+```
+# Figure 3: Heatmap
+
+# Prepare data for heatmap (extract normalized counts for top genes)
+```{r}
+#if (!require("BiocManager", quietly = TRUE))
+#install.packages("BiocManager")
+
+#BiocManager::install("ComplexHeatmap")
+
+library(ComplexHeatmap)
+library(circlize) # For color mapping
+
+# 1. Get the top 50 genes by adjusted p-value
+top_genes <- res_df %>%
+  arrange(padj) %>%
+  head(50) %>%
+  rownames()
+
+# 2. Extract the VST-normalized counts for these genes
+mat <- assay(vsd)[top_genes, ]
+
+# 3. Z-score the rows (Standardize)
+# This centers the data so '0' is the average expression for that gene.
+# Red = Above average, Blue = Below average.
+mat <- t(scale(t(mat))) 
+
+# 4. Create an annotation bar for the top (Tumor vs Normal)
+df <- as.data.frame(colData(dds)[, c("definition")])
+colnames(df) <- "Type"
+ha <- HeatmapAnnotation(df = df, 
+                        col = list(Type = c("Primary solid Tumor" = "red2", 
+                                            "Solid Tissue Normal" = "royalblue")))
+
+```
+
+# Generate the heatmap
+```{r}
+# Define the color palette (Blue to White to Red)
+col_fun = colorRamp2(c(-2, 0, 2), c("royalblue", "white", "red2"))
+
+# Create the Heatmap
+heatmap_plot <- Heatmap(mat, 
+        name = "Z-score", 
+        top_annotation = ha,
+        cluster_rows = TRUE, 
+        cluster_columns = TRUE, # This groups similar samples together
+        show_column_names = FALSE,
+        show_row_names = TRUE, # Shows your Top 50 genes
+        row_names_gp = gpar(fontsize = 8),
+        column_title = "Top 50 Differentially Expressed Genes",
+        col = col_fun)
+
+# Draw it
+draw(heatmap_plot)
+
+```
+This heatmap looks a bit cluttered, mostly because there is a large number of samples. So I'm going to make another one that only uses 200 samples to better see the pattern.
+
+
+# Install ID mapping database 
+
+```{r}
+#BiocManager::install("org.Hs.eg.db")
+library(org.Hs.eg.db)
+
+```
+
+# 1. Prepare Data and Map IDs
+```{r}
+
+# Clean the rownames for BOTH objects to remove version dots (e.g., .13, .5)
+rownames(vsd) <- gsub("\\..*", "", rownames(vsd))
+res_df$clean_id <- gsub("\\..*", "", rownames(res_df))
+
+# Map IDs to Symbols for the vsd object
+symbols <- mapIds(org.Hs.eg.db,
+                  keys = rownames(vsd),
+                  column = "SYMBOL",
+                  keytype = "ENSEMBL",
+                  multiVals = "first")
+
+# Create the clean labels
+clean_labels <- ifelse(is.na(symbols), rownames(vsd), symbols)
+rownames(vsd) <- clean_labels
+res_df$presentation_label <- clean_labels
+
+# Get top 50 genes (now with symbols)
+top_genes <- res_df %>%
+  arrange(padj) %>%
+  head(50) %>%
+  pull(presentation_label)
+
+# Extract main data matrix for these 50 genes
+mat <- assay(vsd)[top_genes, ]
+mat <- t(scale(t(mat))) # Z-score Standardization
+
+```
+
+
+# 2. Downsampling (100 Healthy vs. 100 Tumor)
+```{r}
+
+# Get full metadata from the dds object
+coldata_df <- as.data.frame(colData(dds))
+
+# Separate the sample groups
+tumor_samples <- rownames(coldata_df[coldata_df$definition == "Primary solid Tumor", ])
+normal_samples <- rownames(coldata_df[coldata_df$definition == "Solid Tissue Normal", ])
+
+# Randomly select 100 samples from each, ensuring we don't pick more than exist
+# Use a seed for reproducibility
+set.seed(42)
+select_tumor <- sample(tumor_samples, 100)
+select_normal <- sample(normal_samples, 100)
+
+# Combine selected samples
+selected_cols <- c(select_tumor, select_normal)
+
+# Subset both the matrix and metadata for the final plot
+mat_sub <- mat[, selected_cols]
+
+#Create the annotation for just these 200 samples
+df_sub <- data.frame(Type = coldata_df[selected_cols, "definition"])
+rownames(df_sub) <- selected_cols
+
+```
+
+
+# 3. Define annotations and generate new heatmap
+```{r}
+
+# Define the colors for the annotation bar
+ha <- HeatmapAnnotation(df = df_sub,
+                        col = list(Type = c("Primary solid Tumor" = "red2",
+                                            "Solid Tissue Normal" = "royalblue")),
+                        show_legend = TRUE,
+                        annotation_name_gp = gpar(fontsize = 10, face = "bold"))
+
+# Setup color mapping for the Z-score (Blue-White-Red)
+col_fun = colorRamp2(c(-2, 0, 2), c("royalblue", "white", "red2"))
+
+# Create the Heat-map
+heatmap_final <- Heatmap(mat_sub,
+        name = "Z-score", 
+        top_annotation = ha,
+        cluster_rows = TRUE, 
+        cluster_columns = TRUE,
+        show_column_names = FALSE,
+        column_km = 2,
+        row_names_gp = gpar(fontsize = 5),
+        column_title = "Molecular Signature: Top 50 BRCA Genes (n=200)",
+        col = col_fun)
+
+# Draw the final plot
+draw(heatmap_final, merge_legend = TRUE)
+
+```
+
+# Figure 4: Boxplots 
+
+# First, let's look at the clinical metadata
+```{r}
+# View the first few rows of metadata
+col_metadata <- as.data.frame(colData(dds))
+colnames(col_metadata)
+
+```
+```{r}
+table(col_metadata$paper_BRCA_Subtype_PAM50, useNA = "always")
+```
+
+```{r}
+# Specifically look for common TCGA clinical variables
+clinical_vars <- c("ajcc_pathologic_stage", "vital_status", "age_at_index", "paper_BRCA_Subtype_PAM50")
+col_metadata[, colnames(col_metadata) %in% clinical_vars] %>% head()
+
+```
+
+# Figure 4: Boxplots
+
+# Re-run the Transformation (forgot to save it last time!)
+
+```{r}
+# 1. Re-create the Variance Stabilized object
+# This is necessary because 'assay()' needs the transformed matrix
+vsd <- vst(dds, blind = FALSE)
+
+# 2. Clean the IDs to Gene Symbols (just like we did for the heatmap)
+# This ensures you can call genes by name (like "MMP11") instead of ENSG codes
+library(org.Hs.eg.db)
+rownames(vsd) <- gsub("\\..*", "", rownames(vsd))
+symbols <- mapIds(org.Hs.eg.db,
+                  keys = rownames(vsd),
+                  column = "SYMBOL",
+                  keytype = "ENSEMBL",
+                  multiVals = "first")
+
+# Update vsd with clean names
+rownames(vsd) <- ifelse(is.na(symbols), rownames(vsd), symbols)
+
+```
+# Save the vsd object (in case I need to use it again)
+```{r}
+save(vsd, file = "brca_vst_transformed.rda")
+
+```
+
+# Generate the boxplot 
+
+```{r}
+library(ggplot2)
+
+# 1. Prepare the data
+# We'll pull the counts for MMP11 and combine with PAM50 labels
+gene_to_plot <- "MMP11"
+boxplot_data <- data.frame(
+  Expression = assay(vsd)[gene_to_plot, ],
+  Subtype = colData(dds)$paper_BRCA_Subtype_PAM50
+)
+
+# 2. Filter out NAs and the 'Normal' subtype (since we already compared to Normal)
+boxplot_data <- boxplot_data %>%
+  filter(!is.na(Subtype), Subtype != "Normal")
+
+# 3. Create the plot
+ggplot(boxplot_data, aes(x = Subtype, y = Expression, fill = Subtype)) +
+  geom_boxplot(outlier.shape = NA) + # Hide outliers to keep it clean
+  geom_jitter(width = 0.2, alpha = 0.2, size = 0.5) + # Show the 1,000+ points subtly
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = paste("Expression of", gene_to_plot, "by PAM50 Subtype"),
+       subtitle = "TCGA-BRCA Clinical Deep-Dive",
+       x = "Molecular Subtype",
+       y = "VST-Normalized Expression") +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14))
+
+```
+
+# Remake the heatmap with Viridis colors for gene expression (to make it easier to understand)
+
+```{r}
+#Load the vst results
+load("brca_vst_transformed.rda")
+```
+
+# Recreate the subsampled matrix
+```{r}
+
+# Clean the results IDs to match the vsd names (Symbols)
+res_df$clean_id <- gsub("\\..*", "", rownames(res_df))
+
+# Map symbols to res_df if you haven't already
+library(org.Hs.eg.db)
+
+res_symbols <- mapIds(org.Hs.eg.db, keys = res_df$clean_id, column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+res_df$presentation_label <- ifelse(is.na(res_symbols), res_df$clean_id, res_symbols)
+
+# Get top 50 genes
+top_genes <- res_df %>% arrange(padj) %>% head(50) %>% pull(presentation_label)
+
+# Extract and Scale
+mat <- assay(vsd)[top_genes, ]
+mat <- t(scale(t(mat)))
+
+# Down sample (using seed 42)
+set.seed(42)
+coldata_df <- as.data.frame(colData(dds))
+tumor_samples <- rownames(coldata_df[coldata_df$definition == "Primary solid Tumor", ])
+normal_samples <- rownames(coldata_df[coldata_df$definition == "Solid Tissue Normal", ])
+
+selected_cols <- c(sample(tumor_samples, 100), sample(normal_samples, 100))
+mat_sub <- mat[, selected_cols]
+df_sub <- data.frame(Type = coldata_df[selected_cols, "definition"])
+
+```
+
+# Plot the heatmap with the Viridis Palette
+```{r}
+library(ComplexHeatmap)
+library(viridis)
+library(circlize)
+
+ha = HeatmapAnnotation(df = df_sub, 
+                       col = list(Type = c("Primary solid Tumor" = "red2", 
+                                           "Solid Tissue Normal" = "royalblue")))
+
+# Viridis color mapping: Purple (Low), Teal (Mean), Yellow (High)
+col_fun = colorRamp2(c(-2, 0, 2), viridis(3))
+
+heatmap_final <- Heatmap(mat_sub, 
+        name = "Z-score", 
+        top_annotation = ha,
+        cluster_rows = TRUE, 
+        cluster_columns = TRUE,
+        show_column_names = FALSE,
+        column_km = 2,
+        row_names_gp = gpar(fontsize = 5),
+        column_title = "Molecular Signature: Top 50 BRCA Genes (n=200)",
+        col = col_fun)
+
+draw(heatmap_final, merge_legend = TRUE)
+
+```
+
+
+```{r}
+
+
+```
+
